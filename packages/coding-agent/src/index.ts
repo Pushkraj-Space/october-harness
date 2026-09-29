@@ -302,8 +302,15 @@ export {
 	type RetrySettings,
 	SettingsManager,
 	type SettingsManagerCreateOptions,
+	type ShellRunnerMountSettings,
+	type ShellRunnerSettings,
 	type TuiMode,
 } from "./core/settings-manager.ts";
+export {
+	resolveShellRunner,
+	type ShellRunnerSelection,
+	type ShellRunnerSettingsInput,
+} from "./core/shell-runner.ts";
 // Skills
 export {
 	formatSkillsForPrompt,
@@ -318,6 +325,7 @@ export { createSyntheticSourceInfo } from "./core/source-info.ts";
 export { type EditDiffResult, generateDiffString, generateUnifiedPatch } from "./core/tools/edit-diff.ts";
 // Tools
 export {
+	type BashExecOptions,
 	type BashOperations,
 	type BashSpawnContext,
 	type BashSpawnHook,
