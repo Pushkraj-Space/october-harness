@@ -7,10 +7,11 @@
 
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { type Api, type ImageContent, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
 import chalk from "chalk";
-import { type Args, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
+import { type Args, isValidThinkingLevel, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
 import {
 	type AuthCheckResult,
 	checkProviderAuth,
@@ -563,43 +564,63 @@ export async function createSessionManager(
 /** Bounds the one October catalogue fetch a one-shot run may make before resolving its model. */
 const OCTOBER_CLI_CATALOG_TIMEOUT_MS = 5_000;
 
+interface OctoberCliModel {
+	model?: Model<Api>;
+	thinkingLevel?: ThinkingLevel;
+	diagnostic?: AgentSessionRuntimeDiagnostic;
+}
+
 /**
- * Desktop runs `--provider october --model <gateway id>`. The October catalogue starts as the seed
- * list, so a gateway-served id (e.g. `openrouter/deepseek/deepseek-v4`) would resolve as a custom
- * model id with a warning. When the requested id is missing, fetch the live catalogue once, bounded,
- * before resolving. If the live catalogue does not offer the id either, return a typed error instead
- * of sending an unserved id. A failed fetch keeps the id as given; the gateway then decides.
+ * Desktop runs `--provider october --model <gateway id>`. Gateway ids are exact, so this resolves
+ * them verbatim instead of through the fuzzy resolver, which could pick a different model
+ * (`openrouter/deepseek/deepseek-v4` partially matches `openrouter/deepseek/deepseek-v4.1-flash`).
+ * The catalogue starts as the seed list; a missing id triggers one bounded fetch of the live
+ * catalogue. An id the live catalogue does not offer is a `model_not_found` error. If the fetch
+ * fails, the id is sent as given and the gateway decides. Returns undefined for other providers.
  */
-async function refreshOctoberCatalogForCliModel(
-	parsed: Args,
-	modelRuntime: ModelRuntime,
-): Promise<AgentSessionRuntimeDiagnostic | undefined> {
-	if (!parsed.model) return undefined;
-	const uncataloguedOctoberId = (): string | undefined => {
-		const { model } = resolveCliModel({
-			cliProvider: parsed.provider,
-			cliModel: parsed.model,
-			cliThinking: parsed.thinking,
-			modelRuntime,
-		});
-		if (!model || model.provider !== OCTOBER_PROVIDER_ID) return undefined;
-		return modelRuntime.getModel(OCTOBER_PROVIDER_ID, model.id) ? undefined : model.id;
-	};
-	if (uncataloguedOctoberId() === undefined) return undefined;
-	try {
-		await modelRuntime.refresh({
-			providers: [OCTOBER_PROVIDER_ID],
-			signal: AbortSignal.timeout(OCTOBER_CLI_CATALOG_TIMEOUT_MS),
-		});
-	} catch {
-		return undefined;
+async function resolveOctoberCliModel(parsed: Args, modelRuntime: ModelRuntime): Promise<OctoberCliModel | undefined> {
+	if (!parsed.model || parsed.provider?.toLowerCase() !== OCTOBER_PROVIDER_ID) return undefined;
+	let id = parsed.model;
+	let thinkingLevel: ThinkingLevel | undefined;
+	const lastColon = id.lastIndexOf(":");
+	const suffix = id.slice(lastColon + 1);
+	if (!parsed.thinking && lastColon !== -1 && isValidThinkingLevel(suffix)) {
+		id = id.slice(0, lastColon);
+		thinkingLevel = suffix;
 	}
-	const missingId = uncataloguedOctoberId();
-	if (missingId === undefined || !octoberCatalogIsLive()) return undefined;
+
+	let model = modelRuntime.getModel(OCTOBER_PROVIDER_ID, id);
+	if (!model) {
+		try {
+			await modelRuntime.refresh({
+				providers: [OCTOBER_PROVIDER_ID],
+				signal: AbortSignal.timeout(OCTOBER_CLI_CATALOG_TIMEOUT_MS),
+			});
+		} catch {
+			// Unreachable catalogue: handled below as an unverified id.
+		}
+		model = modelRuntime.getModel(OCTOBER_PROVIDER_ID, id);
+	}
+	if (model) return { model, thinkingLevel };
+	if (octoberCatalogIsLive()) {
+		return {
+			diagnostic: {
+				type: "error",
+				code: "model_not_found",
+				message: `Model "${id}" is not offered by October (model_not_found). Use --list-models to see available models.`,
+			},
+		};
+	}
+	const [base] = modelRuntime.getModels(OCTOBER_PROVIDER_ID);
+	if (!base) return undefined;
 	return {
-		type: "error",
-		code: "model_not_found",
-		message: `Model "${missingId}" is not offered by October (model_not_found). Use --list-models to see available models.`,
+		model: { ...base, id, name: id },
+		thinkingLevel,
+		diagnostic: {
+			type: "warning",
+			code: "model_unverified",
+			message: `Could not load the October model catalogue; using "${id}" as given.`,
+		},
 	};
 }
 
@@ -609,6 +630,7 @@ function buildSessionOptions(
 	hasExistingSession: boolean,
 	modelRuntime: ModelRuntime,
 	settingsManager: SettingsManager,
+	octoberModel?: OctoberCliModel,
 ): {
 	options: CreateAgentSessionOptions;
 	cliThinkingFromModel: boolean;
@@ -621,7 +643,14 @@ function buildSessionOptions(
 	// Model from CLI
 	// - supports --provider <name> --model <pattern>
 	// - supports --model <provider>/<pattern>
-	if (parsed.model) {
+	if (octoberModel) {
+		if (octoberModel.diagnostic) diagnostics.push(octoberModel.diagnostic);
+		options.model = octoberModel.model;
+		if (!parsed.thinking && octoberModel.thinkingLevel) {
+			options.thinkingLevel = octoberModel.thinkingLevel;
+			cliThinkingFromModel = true;
+		}
+	} else if (parsed.model) {
 		const resolved = resolveCliModel({
 			cliProvider: parsed.provider,
 			cliModel: parsed.model,
@@ -1009,10 +1038,8 @@ export async function main(args: string[], options?: MainOptions) {
 			scopedModels = scope.scopedModels;
 			diagnostics.push(...scope.diagnostics);
 		}
-		const octoberModelError =
-			!offlineMode && appMode !== "interactive"
-				? await refreshOctoberCatalogForCliModel(parsed, modelRuntime)
-				: undefined;
+		const octoberModel =
+			!offlineMode && appMode !== "interactive" ? await resolveOctoberCliModel(parsed, modelRuntime) : undefined;
 		const {
 			options: sessionOptions,
 			cliThinkingFromModel,
@@ -1023,13 +1050,9 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionManager.buildSessionContext().messages.length > 0,
 			modelRuntime,
 			settingsManager,
+			octoberModel,
 		);
-		if (octoberModelError) {
-			// The resolver's "Using custom model id" warning would contradict the error.
-			diagnostics.push(octoberModelError, ...sessionOptionDiagnostics.filter((d) => d.type === "error"));
-		} else {
-			diagnostics.push(...sessionOptionDiagnostics);
-		}
+		diagnostics.push(...sessionOptionDiagnostics);
 
 		if (parsed.apiKey) {
 			if (!sessionOptions.model) {

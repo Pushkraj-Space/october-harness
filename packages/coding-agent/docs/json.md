@@ -20,7 +20,7 @@ Read stdout continuously. A reader that stops consuming records can stall Pi whe
 
 ## Startup diagnostics
 
-Warnings and errors found while starting, such as a model resolved as a custom id or a new `--session-id`, are emitted as `diagnostic` records before the session header. They carry no `stopReason`, so a warning never reads as a failed turn. `code` is present when the diagnostic has a stable identifier.
+Warnings and errors found while starting, such as an unknown or unverified model id or a new `--session-id`, are emitted as `diagnostic` records before the session header. They carry no `stopReason`, so a warning never reads as a failed turn. `code` is present when the diagnostic has a stable identifier.
 
 ```json
 {"type":"diagnostic","level":"warning","code":"session_created","message":"No project session found with id '...'; creating a new session with that id."}

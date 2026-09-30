@@ -11,6 +11,8 @@ import { ENV_AGENT_DIR } from "../src/config.ts";
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const sourceResolverPath = resolve(__dirname, "../src/experimental/source-resolver.ts");
 const PAID_ID = "openrouter/deepseek/deepseek-v4";
+// Partially matches PAID_ID; the live gateway lists it, and fuzzy resolution once picked it instead.
+const NEAR_MISS_ID = "openrouter/deepseek/deepseek-v4.1-flash:batch";
 
 const servers: Server[] = [];
 const tempDirs: string[] = [];
@@ -121,7 +123,7 @@ async function runOctoberJson(
 
 describe("October --mode json startup", () => {
 	it("resolves a gateway-served OpenRouter id without a warning and sends it verbatim", async () => {
-		const gateway = await startGateway(["october/Qwen/Qwen3.6-35B-A3B-FP8", PAID_ID]);
+		const gateway = await startGateway(["october/Qwen/Qwen3.6-35B-A3B-FP8", NEAR_MISS_ID, PAID_ID]);
 		const result = await runOctoberJson(gateway);
 
 		expect(result.code, result.stderr).toBe(0);
@@ -130,8 +132,8 @@ describe("October --mode json startup", () => {
 		expect(result.stderr).not.toMatch(/not found/i);
 	}, 60_000);
 
-	it("fails with a typed model_not_found diagnostic when the live catalogue does not offer the id", async () => {
-		const gateway = await startGateway(["october/Qwen/Qwen3.6-35B-A3B-FP8"]);
+	it("fails with model_not_found instead of substituting a similar id the live catalogue offers", async () => {
+		const gateway = await startGateway(["october/Qwen/Qwen3.6-35B-A3B-FP8", NEAR_MISS_ID]);
 		const result = await runOctoberJson(gateway);
 
 		expect(result.code).toBe(1);
@@ -146,7 +148,7 @@ describe("October --mode json startup", () => {
 			},
 		]);
 		expect(diagnostics[0]).not.toHaveProperty("stopReason");
-		expect(result.stderr).not.toMatch(/model_not_found|Using custom model id/);
+		expect(result.stderr).toBe("");
 	}, 60_000);
 
 	it("keeps the requested id and reports the warning as a stdout record when the catalogue is unreachable", async () => {
@@ -156,10 +158,10 @@ describe("October --mode json startup", () => {
 		expect(result.code, result.stderr).toBe(0);
 		expect(gateway.chatModels).toEqual([PAID_ID]);
 		const warning = result.records.find((record) => record.type === "diagnostic");
-		expect(warning).toMatchObject({ type: "diagnostic", level: "warning" });
-		expect(warning?.message).toContain("Using custom model id");
+		expect(warning).toMatchObject({ type: "diagnostic", level: "warning", code: "model_unverified" });
+		expect(warning?.message).toContain(`"${PAID_ID}" as given`);
 		expect(warning).not.toHaveProperty("stopReason");
-		expect(result.stderr).not.toContain("Using custom model id");
+		expect(result.stderr).toBe("");
 	}, 60_000);
 
 	it("reports a new --session-id as a stdout record instead of stderr text", async () => {
