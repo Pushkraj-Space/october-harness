@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Desktop-launched runs refresh the October session only through the October Bus. If the Bus cannot supply a token, the turn fails with an `october_session_unavailable` error instead of refreshing against Supabase directly, and a still-valid token keeps working until it expires. Desktop no longer needs to pass a Supabase refresh token. Standalone sign-in is unchanged.
+- `--mode json` emits startup warnings and errors, such as a custom model id or a new `--session-id`, as `{"type":"diagnostic"}` records on stdout instead of stderr text, so a warning is never read as a turn's failure reason.
+- `--list-models` limits each model availability check to 5 seconds and lists the last known models when a check times out.
+
+### Fixed
+
+- Fixed one-shot October runs warning that a gateway-served model such as `openrouter/deepseek/deepseek-v4` was not found. When the requested id is missing, the October catalogue is fetched once (5 second limit) before resolving; if the live catalogue does not offer it, the run fails with a `model_not_found` error naming the id.
+
 ## [0.87.1-october.2] - 2026-09-25
 
 ### Added

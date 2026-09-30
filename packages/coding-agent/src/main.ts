@@ -47,9 +47,9 @@ import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
-import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
+import { resolveCliModel, resolveModelScopeWithDiagnostics, type ScopedModel } from "./core/model-resolver.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
-import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
+import { flushRawStdout, restoreStdout, takeOverStdout, writeRawStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
 import type { CreateAgentSessionOptions } from "./core/sdk.ts";
 import {
@@ -69,7 +69,9 @@ import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { createBuiltInExtensions } from "./extensions/index.ts";
+import { OCTOBER_PROVIDER_ID } from "./extensions/october/auth.ts";
 import { seedOctoberDefaultPackages } from "./extensions/october/default-packages.ts";
+import { octoberCatalogIsLive } from "./extensions/october/provider.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
@@ -77,6 +79,9 @@ import { validateThemeJson } from "./modes/interactive/theme/theme-json.ts";
 import { cleanupManagedInstall, handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
+
+/** `--list-models` is a metadata command: each availability pass (auth checks, token refresh) gets 5 s. */
+const LIST_MODELS_AVAILABILITY_TIMEOUT_MS = 5_000;
 
 const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP_NAME} -ne".`;
 
@@ -103,7 +108,27 @@ async function readPipedStdin(): Promise<string | undefined> {
 	});
 }
 
-function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
+/**
+ * In `--mode json`, stderr text from a failed run is easily mistaken for its failure reason, so
+ * startup diagnostics go to stdout as NDJSON records instead. The record deliberately has no
+ * `stopReason`: a warning must never read as a failed turn.
+ */
+function reportDiagnostics(
+	diagnostics: readonly AgentSessionRuntimeDiagnostic[],
+	outputMode: "json" | "text" = "text",
+): void {
+	if (outputMode === "json") {
+		for (const diagnostic of diagnostics) {
+			const record = {
+				type: "diagnostic",
+				level: diagnostic.type,
+				...(diagnostic.code ? { code: diagnostic.code } : {}),
+				message: diagnostic.message,
+			};
+			writeRawStdout(`${JSON.stringify(record)}\n`);
+		}
+		return;
+	}
 	for (const diagnostic of diagnostics) {
 		const color = diagnostic.type === "error" ? chalk.red : diagnostic.type === "warning" ? chalk.yellow : chalk.dim;
 		const prefix = diagnostic.type === "error" ? "Error: " : diagnostic.type === "warning" ? "Warning: " : "";
@@ -520,14 +545,62 @@ export async function createSessionManager(
 		if (existingSession) {
 			return SessionManager.open(existingSession.path, sessionDir);
 		}
-		console.error(
-			chalk.yellow(
-				`Warning: No project session found with id '${parsed.sessionId}'; creating a new session with that id.`,
-			),
+		reportDiagnostics(
+			[
+				{
+					type: "warning",
+					code: "session_created",
+					message: `No project session found with id '${parsed.sessionId}'; creating a new session with that id.`,
+				},
+			],
+			parsed.mode === "json" ? "json" : "text",
 		);
 	}
 
 	return SessionManager.create(cwd, sessionDir, { id: parsed.sessionId });
+}
+
+/** Bounds the one October catalogue fetch a one-shot run may make before resolving its model. */
+const OCTOBER_CLI_CATALOG_TIMEOUT_MS = 5_000;
+
+/**
+ * Desktop runs `--provider october --model <gateway id>`. The October catalogue starts as the seed
+ * list, so a gateway-served id (e.g. `openrouter/deepseek/deepseek-v4`) would resolve as a custom
+ * model id with a warning. When the requested id is missing, fetch the live catalogue once, bounded,
+ * before resolving. If the live catalogue does not offer the id either, return a typed error instead
+ * of sending an unserved id. A failed fetch keeps the id as given; the gateway then decides.
+ */
+async function refreshOctoberCatalogForCliModel(
+	parsed: Args,
+	modelRuntime: ModelRuntime,
+): Promise<AgentSessionRuntimeDiagnostic | undefined> {
+	if (!parsed.model) return undefined;
+	const uncataloguedOctoberId = (): string | undefined => {
+		const { model } = resolveCliModel({
+			cliProvider: parsed.provider,
+			cliModel: parsed.model,
+			cliThinking: parsed.thinking,
+			modelRuntime,
+		});
+		if (!model || model.provider !== OCTOBER_PROVIDER_ID) return undefined;
+		return modelRuntime.getModel(OCTOBER_PROVIDER_ID, model.id) ? undefined : model.id;
+	};
+	if (uncataloguedOctoberId() === undefined) return undefined;
+	try {
+		await modelRuntime.refresh({
+			providers: [OCTOBER_PROVIDER_ID],
+			signal: AbortSignal.timeout(OCTOBER_CLI_CATALOG_TIMEOUT_MS),
+		});
+	} catch {
+		return undefined;
+	}
+	const missingId = uncataloguedOctoberId();
+	if (missingId === undefined || !octoberCatalogIsLive()) return undefined;
+	return {
+		type: "error",
+		code: "model_not_found",
+		message: `Model "${missingId}" is not offered by October (model_not_found). Use --list-models to see available models.`,
+	};
 }
 
 function buildSessionOptions(
@@ -696,11 +769,9 @@ export async function main(args: string[], options?: MainOptions) {
 
 	const parsed = parseArgs(args);
 	if (parsed.diagnostics.length > 0) {
-		for (const d of parsed.diagnostics) {
-			const color = d.type === "error" ? chalk.red : chalk.yellow;
-			console.error(color(`${d.type === "error" ? "Error" : "Warning"}: ${d.message}`));
-		}
+		reportDiagnostics(parsed.diagnostics, parsed.mode === "json" ? "json" : "text");
 		if (parsed.diagnostics.some((d) => d.type === "error")) {
+			await flushRawStdout();
 			process.exit(1);
 		}
 	}
@@ -871,7 +942,9 @@ export async function main(args: string[], options?: MainOptions) {
 			cwd,
 			agentDir,
 			settingsManager: runtimeSettingsManager,
-			modelRuntimeSignal: AbortSignal.timeout(15_000),
+			modelRuntimeSignal: AbortSignal.timeout(
+				parsed.listModels !== undefined ? LIST_MODELS_AVAILABILITY_TIMEOUT_MS : 15_000,
+			),
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
 				? {
@@ -928,10 +1001,18 @@ export async function main(args: string[], options?: MainOptions) {
 		];
 
 		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
-		const scopedModels =
-			modelPatterns && modelPatterns.length > 0
-				? await resolveModelScope(modelPatterns, modelRuntime, { signal: AbortSignal.timeout(15_000) })
-				: [];
+		let scopedModels: ScopedModel[] = [];
+		if (modelPatterns && modelPatterns.length > 0) {
+			const scope = await resolveModelScopeWithDiagnostics(modelPatterns, modelRuntime, {
+				signal: AbortSignal.timeout(15_000),
+			});
+			scopedModels = scope.scopedModels;
+			diagnostics.push(...scope.diagnostics);
+		}
+		const octoberModelError =
+			!offlineMode && appMode !== "interactive"
+				? await refreshOctoberCatalogForCliModel(parsed, modelRuntime)
+				: undefined;
 		const {
 			options: sessionOptions,
 			cliThinkingFromModel,
@@ -943,7 +1024,12 @@ export async function main(args: string[], options?: MainOptions) {
 			modelRuntime,
 			settingsManager,
 		);
-		diagnostics.push(...sessionOptionDiagnostics);
+		if (octoberModelError) {
+			// The resolver's "Using custom model id" warning would contradict the error.
+			diagnostics.push(octoberModelError, ...sessionOptionDiagnostics.filter((d) => d.type === "error"));
+		} else {
+			diagnostics.push(...sessionOptionDiagnostics);
+		}
 
 		if (parsed.apiKey) {
 			if (!sessionOptions.model) {
@@ -1004,7 +1090,7 @@ export async function main(args: string[], options?: MainOptions) {
 	if (parsed.listModels !== undefined) {
 		reportDiagnostics(startupSettingsDiagnostics);
 		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
-		await listModels(modelRuntime, searchPattern, AbortSignal.timeout(15_000));
+		await listModels(modelRuntime, searchPattern, AbortSignal.timeout(LIST_MODELS_AVAILABILITY_TIMEOUT_MS));
 		process.exit(0);
 	}
 
@@ -1034,12 +1120,13 @@ export async function main(args: string[], options?: MainOptions) {
 	const startupDiagnostics = deduplicateDiagnostics([...startupSettingsDiagnostics, ...runtime.diagnostics]);
 	const hasRuntimeErrors = runtime.diagnostics.some((diagnostic) => diagnostic.type === "error");
 	if (appMode !== "interactive" || hasRuntimeErrors) {
-		reportDiagnostics(startupDiagnostics);
+		reportDiagnostics(startupDiagnostics, appMode === "json" ? "json" : "text");
 	}
 	if (hasRuntimeErrors) {
 		if (runtime.diagnostics.some((diagnostic) => diagnostic.message.includes("Failed to load extension"))) {
 			console.error(chalk.yellow(EXTENSION_LOAD_FAILURE_HINT));
 		}
+		await flushRawStdout();
 		process.exit(1);
 	}
 	time("createAgentSession");
