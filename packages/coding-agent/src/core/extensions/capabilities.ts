@@ -107,7 +107,11 @@ function coversEntry(root: string, manifestEntry: string, entryPath: string): bo
 		return isWithin(entryPath, path.resolve(root, manifestEntry));
 	}
 	const pattern = path.posix.normalize(manifestEntry.split(path.sep).join("/"));
-	for (let candidate = entryPath; candidate !== root && isWithin(candidate, root); candidate = path.dirname(candidate)) {
+	for (
+		let candidate = entryPath;
+		candidate !== root && isWithin(candidate, root);
+		candidate = path.dirname(candidate)
+	) {
 		if (minimatch(path.relative(root, candidate).split(path.sep).join("/"), pattern, { dot: true })) return true;
 	}
 	return false;
