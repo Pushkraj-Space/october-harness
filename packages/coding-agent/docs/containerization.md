@@ -215,7 +215,7 @@ Set `shellRunner` in the agent-directory settings file (`~/.october/agent/settin
 
 The policy is read once when Pi starts. Reload, `/new`, `/resume` and forks keep it, even if the settings file changes. Restart Pi to apply a change.
 
-At startup Pi prints the active runner, each mount and whether it is read-only, and the allowlist. In print, JSON and RPC modes this line goes to stderr. `{ "type": "host" }` selects the normal host shell explicitly and prints a one-line notice; without the setting nothing is printed.
+At startup Pi prints the active runner, each mount and whether it is read-only, and the allowlist. In print and RPC modes this line goes to stderr; in JSON mode it is a [`diagnostic` record](json.md#startup-diagnostics) with `code` `shell_runner` on stdout. `{ "type": "host" }` selects the normal host shell explicitly and prints a one-line notice; without the setting nothing is printed.
 
 ### Prepare the image
 
@@ -230,6 +230,8 @@ Each mount is bind-mounted at the same path inside the container, so paths in co
 
 - Paths may be absolute, start with `~`, or be relative to the session's working directory when Pi starts.
 - Without `mounts`, the session working directory is mounted read-write. An explicit list replaces this default; an empty list mounts nothing, so every command fails.
+- The default read-write mount includes the project's `.git/` and `.october/` directories. Git hooks, git config and project extensions stored there are later run by processes on the host, so a command in the container can plant code that runs outside it. Mount `.git` (and `.october`, if present) read-only, as in the example above, unless commands must write to them.
+- A mount that contains the agent directory (for example `~`) exposes its credentials, such as `auth.json`. Pi adds a warning to the startup notice when this happens.
 - Nested mounts are allowed, for example a read-only `.git` inside a read-write project.
 - Two entries that resolve to the same directory are rejected. So are paths that are missing, not directories, or contain a comma, a double quote or a control character.
 - A command runs only when its working directory is inside a mount. If a mount is replaced or a symlink in it is retargeted after startup, commands are rejected until Pi restarts.
@@ -255,7 +257,7 @@ At startup Pi resolves the `docker` executable to an absolute path and asks it f
 
 If the runner cannot be used, every shell command fails with the cause and nothing runs on the host. Causes include:
 
-- an agent-directory settings file that is empty, contains a JSON array or another non-object value, cannot be parsed, or cannot be read (including a permission error on its directory);
+- an agent-directory settings file that cannot be parsed, holds a non-object value such as `null` or a number, or cannot be read (including a permission error on its directory). An empty file or a JSON array cannot hold a policy and means the host shell, like a missing file;
 - an invalid `shellRunner` value, such as an unknown type or field, an empty image, an invalid mount, allowlist name or `user`;
 - a Windows host, a missing `docker` CLI, or an unsupported endpoint;
 - a working directory outside every mount, or a mount that changed after startup.
@@ -267,7 +269,7 @@ Fix the cause and restart Pi. A missing image or a stopped daemon fails the indi
 Each container is named `october-shell-<pid>-<random>` and labeled with its owner: `dev.october.shell-runner=1` plus `.pid`, `.host`, `.uid` and `.pidns`.
 
 - After every command, including aborted and timed-out ones, Pi runs `docker rm -f -v <name>` for up to 10 seconds. If removal cannot be confirmed, Pi adds a line naming the container to the command output; the command keeps its own result.
-- When Pi exits, including on Ctrl+C, SIGTERM and SIGHUP, it removes containers that may still exist, within 5 seconds.
+- When Pi exits, including on Ctrl+C (SIGINT), SIGTERM and SIGHUP, it removes containers that may still exist, within 5 seconds.
 - Replacing the session (`/new`, `/resume`, fork) waits for running commands and their cleanup to finish. Quitting does not wait.
 - On startup, Pi removes containers left by earlier Pi processes of the same user on the same host and PID namespace whose owner process no longer exists. Containers whose owner may still be alive are kept. If a process ID was reused, the container is kept for manual cleanup.
 

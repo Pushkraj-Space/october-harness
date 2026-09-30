@@ -13,6 +13,7 @@ import { readlinkSync, realpathSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { findExecutableOnPath, getShellEnv } from "../utils/shell.ts";
 import type { ShellRunnerSettings } from "./settings-manager.ts";
@@ -298,6 +299,11 @@ async function sweepOrphanedContainers(client: DockerClient, owner: OwnerIdentit
 		: `Docker shell runner: could not remove stale containers on ${client.endpoint}: ${removal.failure}`;
 }
 
+/** Component-aware containment: /proj2 is not inside /proj, and / contains everything. */
+function isWithin(path: string, dir: string): boolean {
+	return path === dir || path.startsWith(dir.endsWith("/") ? dir : `${dir}/`);
+}
+
 function resolveMounts(settings: DockerShellRunnerSettings, cwd: string): DockerMount[] | string {
 	const mounts: DockerMount[] = [];
 	for (const mount of settings.mounts ?? [{ path: cwd }]) {
@@ -338,6 +344,20 @@ async function resolveEndpoint(client: Pick<DockerClient, "executable" | "env">)
 	return result.stdout.trim();
 }
 
+/** Warn when a mount exposes the agent directory, which holds credentials such as auth.json. */
+function formatAgentDirWarning(mounts: readonly DockerMount[]): string {
+	let agentDir = resolve(getAgentDir());
+	try {
+		agentDir = realpathSync(agentDir);
+	} catch {
+		// A missing agent directory is still checked by its configured path.
+	}
+	const exposing = mounts.find((mount) => isWithin(agentDir, mount.real));
+	return exposing
+		? ` Warning: mount ${exposing.real} contains the agent directory ${agentDir}; commands can read its credentials (auth.json).`
+		: "";
+}
+
 function formatNotice(settings: DockerShellRunnerSettings, mounts: readonly DockerMount[]): string {
 	const mountText =
 		mounts.length === 0
@@ -345,7 +365,7 @@ function formatNotice(settings: DockerShellRunnerSettings, mounts: readonly Dock
 			: mounts.map((mount) => `${mount.real} (${mount.readOnly ? "read-only" : "read-write"})`).join(", ");
 	const allowlist =
 		settings.envAllowlist && settings.envAllowlist.length > 0 ? settings.envAllowlist.join(", ") : "none";
-	return `Shell runner: docker (image ${settings.image}). Mounts: ${mountText}. Environment allowlist: ${allowlist}. ${SHELL_RUNNER_SCOPE_NOTICE}`;
+	return `Shell runner: docker (image ${settings.image}). Mounts: ${mountText}. Environment allowlist: ${allowlist}. ${SHELL_RUNNER_SCOPE_NOTICE}${formatAgentDirWarning(mounts)}`;
 }
 
 /**
@@ -427,8 +447,7 @@ export async function createDockerShellRunner(
 		} catch {
 			throw new Error(`Working directory does not exist: ${commandCwd}\nCannot execute docker commands.`);
 		}
-		// Component-aware containment: /proj2 is not inside /proj, and / contains everything.
-		if (!mounts.some(({ real }) => realCwd === real || realCwd.startsWith(real.endsWith("/") ? real : `${real}/`))) {
+		if (!mounts.some(({ real }) => isWithin(realCwd, real))) {
 			throw new Error(
 				`Docker shell runner: working directory ${realCwd} is outside every configured mount. The command was not run.`,
 			);

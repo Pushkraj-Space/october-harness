@@ -90,6 +90,24 @@ export type DefaultProjectTrust = "ask" | "always" | "never";
 
 export type TransportSetting = Transport;
 
+export interface McpStdioServerSettings {
+	transport: "stdio";
+	command: string;
+	args?: string[];
+	env?: Record<string, string>;
+	cwd?: string;
+	timeoutMs?: number;
+}
+
+export interface McpHttpServerSettings {
+	transport: "http";
+	url: string;
+	headers?: Record<string, string>;
+	timeoutMs?: number;
+}
+
+export type McpServerSettings = McpStdioServerSettings | McpHttpServerSettings;
+
 /**
  * Package source for npm/git packages.
  * - String form: load all resources from the package
@@ -183,6 +201,7 @@ export interface Settings {
 	fullscreenScrollbar?: ScrollViewScrollbar; // default: "auto"; no effect in regular TUI mode
 	fullscreenCopyOnSelect?: boolean; // default: true; no effect in regular TUI mode
 	shellRunner?: ShellRunnerSettings; // global setting only; fixed for the process at startup
+	mcpServers?: Record<string, McpServerSettings>; // Optional third-party MCP servers
 }
 
 function isMergeableObject(value: unknown): value is Record<string, unknown> {
@@ -359,7 +378,6 @@ export class SettingsManager {
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
 	private modifiedProjectNestedFields = new Map<keyof Settings, Set<string>>(); // Track project nested field modifications
 	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors
-	private globalShellPolicyError: Error | null = null; // Global file loaded but cannot be a shell runner policy source
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
@@ -374,14 +392,12 @@ export class SettingsManager {
 		initialErrors: SettingsError[] = [],
 		projectTrusted = true,
 		settingsPaths: SettingsPaths = {},
-		globalShellPolicyError: Error | null = null,
 	) {
 		this.storage = storage;
 		this.globalSettings = initialGlobal;
 		this.projectSettings = initialProject;
 		this.projectTrusted = projectTrusted;
 		this.globalSettingsLoadError = globalLoadError;
-		this.globalShellPolicyError = globalShellPolicyError;
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
 		this.settingsPaths = settingsPaths;
@@ -434,7 +450,6 @@ export class SettingsManager {
 			initialErrors,
 			projectTrusted,
 			settingsPaths,
-			globalLoad.policyError,
 		);
 	}
 
@@ -446,17 +461,9 @@ export class SettingsManager {
 		return SettingsManager.fromStorage(storage, options);
 	}
 
-	/**
-	 * Load one settings scope. `policyError` reports a file that loads as settings but cannot be
-	 * trusted as a shell runner policy source (empty file or JSON array).
-	 */
-	private static loadFromStorage(
-		storage: SettingsStorage,
-		scope: SettingsScope,
-		projectTrusted = true,
-	): { settings: Settings; policyError: Error | null } {
+	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope, projectTrusted = true): Settings {
 		if (scope === "project" && !projectTrusted) {
-			return { settings: {}, policyError: null };
+			return {};
 		}
 
 		let content: string | undefined;
@@ -466,7 +473,7 @@ export class SettingsManager {
 		});
 
 		if (!content) {
-			return { settings: {}, policyError: content === "" ? new Error("the file is empty") : null };
+			return {};
 		}
 		const settings: unknown = JSON.parse(stripBom(content));
 		if (typeof settings !== "object" || settings === null) {
@@ -474,21 +481,18 @@ export class SettingsManager {
 				`Settings file must contain a JSON object, found ${settings === null ? "null" : typeof settings}`,
 			);
 		}
-		return {
-			settings: SettingsManager.migrateSettings(settings as Record<string, unknown>),
-			policyError: Array.isArray(settings) ? new Error("the file contains a JSON array, not an object") : null,
-		};
+		return SettingsManager.migrateSettings(settings as Record<string, unknown>);
 	}
 
 	private static tryLoadFromStorage(
 		storage: SettingsStorage,
 		scope: SettingsScope,
 		projectTrusted = true,
-	): { settings: Settings; error: Error | null; policyError: Error | null } {
+	): { settings: Settings; error: Error | null } {
 		try {
-			return { ...SettingsManager.loadFromStorage(storage, scope, projectTrusted), error: null };
+			return { settings: SettingsManager.loadFromStorage(storage, scope, projectTrusted), error: null };
 		} catch (error) {
-			return { settings: {}, error: error as Error, policyError: null };
+			return { settings: {}, error: error as Error };
 		}
 	}
 
@@ -562,6 +566,11 @@ export class SettingsManager {
 		return structuredClone(this.projectSettings);
 	}
 
+	/** Snapshot of global settings merged with trusted project overrides. */
+	getSettings(): Settings {
+		return structuredClone(this.settings);
+	}
+
 	isProjectTrusted(): boolean {
 		return this.projectTrusted;
 	}
@@ -597,7 +606,6 @@ export class SettingsManager {
 		if (!globalLoad.error) {
 			this.globalSettings = globalLoad.settings;
 			this.globalSettingsLoadError = null;
-			this.globalShellPolicyError = globalLoad.policyError;
 		} else {
 			this.globalSettingsLoadError = globalLoad.error;
 			this.recordError("global", globalLoad.error);
@@ -1086,8 +1094,9 @@ export class SettingsManager {
 
 	/**
 	 * Read the shell runner policy from global settings only. Project settings cannot select or
-	 * weaken it. `error` is set when the global file exists but cannot be used as a policy source.
-	 * Absent `settings` and `error` mean the default host runner.
+	 * weaken it. `error` is set when the global file exists but cannot be read or parsed, since its
+	 * intent is unknown. Absent `settings` and `error` mean the default host runner, including for an
+	 * empty file or a JSON array, which cannot contain a policy.
 	 */
 	getShellRunnerSettings(): { settings?: ShellRunnerSettings | null; error?: string } {
 		const source = this.settingsPaths.global
@@ -1095,9 +1104,6 @@ export class SettingsManager {
 			: "Global settings";
 		if (this.globalSettingsLoadError) {
 			return { error: `${source} could not be loaded: ${this.globalSettingsLoadError.message}` };
-		}
-		if (this.globalShellPolicyError) {
-			return { error: `${source} cannot be used: ${this.globalShellPolicyError.message}` };
 		}
 		if (!Object.hasOwn(this.globalSettings, "shellRunner")) {
 			return {};

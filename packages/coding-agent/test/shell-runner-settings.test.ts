@@ -31,9 +31,13 @@ describe("shell runner settings", () => {
 
 	const read = (dir = agentDir) => SettingsManager.create(projectDir, dir).getShellRunnerSettings();
 
-	it("means host with no notice for a missing file or a file without shellRunner", async () => {
-		expect(read()).toEqual({});
-		writeFileSync(globalPath, JSON.stringify({ theme: "dark" }));
+	it.each([
+		["missing", undefined],
+		["empty", ""],
+		["array", "[]"],
+		["no shellRunner", JSON.stringify({ theme: "dark" })],
+	])("means host with no notice for a %s global file", async (_name, content) => {
+		if (content !== undefined) writeFileSync(globalPath, content);
 		expect(read()).toEqual({});
 		expect(await resolveShellRunner(read(), projectDir)).toEqual({ kind: "host" });
 	});
@@ -58,10 +62,8 @@ describe("shell runner settings", () => {
 	});
 
 	it.each([
-		["empty", "", /cannot be used: the file is empty/],
 		["whitespace-only", "  \n", /could not be loaded/],
 		["malformed", "{ nope", /could not be loaded/],
-		["array", "[]", /cannot be used: the file contains a JSON array/],
 		["null", "null", /could not be loaded: Settings file must contain a JSON object, found null/],
 		["scalar", "42", /could not be loaded: Settings file must contain a JSON object, found number/],
 	])("blocks shell commands for a %s global file", async (_name, content, cause) => {
@@ -78,10 +80,10 @@ describe("shell runner settings", () => {
 		writeFileSync(globalPath, "");
 		const manager = SettingsManager.create(projectDir, agentDir);
 		expect(manager.drainErrors()).toEqual([]);
+		expect(manager.getShellRunnerSettings()).toEqual({});
 		manager.setTheme("light");
 		await manager.flush();
 		expect(JSON.parse(readFileSync(globalPath, "utf8"))).toEqual({ theme: "light" });
-		expect(manager.getShellRunnerSettings().error).toMatch(/the file is empty/);
 	});
 
 	it.skipIf(isRoot)("blocks for an unreadable file or directory", () => {
@@ -105,8 +107,8 @@ describe("shell runner settings", () => {
 		writeFileSync(globalPath, JSON.stringify({ shellRunner: { type: "host" } }));
 		await manager.reload();
 		expect(manager.getShellRunnerSettings()).toEqual({ settings: { type: "host" } });
-		writeFileSync(globalPath, "");
+		writeFileSync(globalPath, "{ nope");
 		await manager.reload();
-		expect(manager.getShellRunnerSettings().error).toMatch(/the file is empty/);
+		expect(manager.getShellRunnerSettings().error).toMatch(/could not be loaded/);
 	});
 });

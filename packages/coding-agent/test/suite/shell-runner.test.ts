@@ -167,7 +167,7 @@ describeUnix("shell runner routing", () => {
 	it("reports an invalid runner through ! commands instead of running on the host", async () => {
 		const harness = await createHarness({
 			shellRunner: await resolveShellRunner(
-				{ error: "Global settings file x cannot be used: the file is empty" },
+				{ error: "Global settings file x could not be loaded: Unexpected end of JSON input" },
 				"/",
 			),
 		});

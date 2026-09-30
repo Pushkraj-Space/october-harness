@@ -2,13 +2,16 @@ import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removeOutstandingDockerContainers } from "../src/core/docker-shell-runner.ts";
+import { resolveShellRunner } from "../src/core/shell-runner.ts";
 import {
 	type BashOperations,
 	createBashTool,
 	createLocalBashOperations,
 	createLocalShellOperations,
 } from "../src/core/tools/bash.ts";
+import { installFakeDocker } from "./fake-docker-cli.ts";
 import { createFakeShellRunner, type FakeShellRunner } from "./fake-shell-runner.ts";
 
 // issue #17: every runner (host, fake, Docker) must satisfy the same BashOperations contract.
@@ -16,15 +19,42 @@ import { createFakeShellRunner, type FakeShellRunner } from "./fake-shell-runner
 interface RunnerUnderTest {
 	operations: BashOperations;
 	fake?: FakeShellRunner;
+	cleanup?: () => void;
 }
 
-const runners: Array<[string, () => RunnerUnderTest]> = [
-	["host", () => ({ operations: createLocalBashOperations() })],
+const runners: Array<[string, (dir: string) => Promise<RunnerUnderTest>]> = [
+	["host", async () => ({ operations: createLocalBashOperations() })],
 	[
 		"fake",
-		() => {
+		async () => {
 			const fake = createFakeShellRunner();
 			return { operations: fake.operations, fake };
+		},
+	],
+	[
+		// The Docker adapter's own code path, against the fake docker CLI. Real Docker is covered by
+		// docker-shell-runner.integration.test.ts.
+		"docker (fake CLI)",
+		async (dir) => {
+			const root = realpathSync(mkdtempSync(join(tmpdir(), "shell-runner-contract-docker-")));
+			const docker = installFakeDocker(root);
+			vi.stubEnv("PATH", `${docker.binDir}:${process.env.PATH}`);
+			vi.stubEnv("FAKE_DOCKER_STATE", docker.stateDir);
+			vi.stubEnv("DOCKER_HOST", undefined);
+			vi.stubEnv("DOCKER_CONTEXT", undefined);
+			const selection = await resolveShellRunner(
+				{ settings: { type: "docker", image: "shell:test", envAllowlist: ["CONTRACT_VAR"] } },
+				dir,
+			);
+			if (selection.kind !== "docker") throw new Error(`expected docker, got ${selection.notice}`);
+			return {
+				operations: selection.operations,
+				cleanup: () => {
+					removeOutstandingDockerContainers();
+					vi.unstubAllEnvs();
+					rmSync(root, { recursive: true, force: true });
+				},
+			};
 		},
 	],
 ];
@@ -46,12 +76,13 @@ describeUnix.each(runners)("shell runner contract: %s", (_name, create) => {
 	let dir: string;
 	let runner: RunnerUnderTest;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		dir = realpathSync(mkdtempSync(join(tmpdir(), "shell-runner-contract-")));
-		runner = create();
+		runner = await create(dir);
 	});
 
 	afterEach(() => {
+		runner.cleanup?.();
 		rmSync(dir, { recursive: true, force: true });
 	});
 

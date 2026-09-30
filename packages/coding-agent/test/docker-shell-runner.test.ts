@@ -16,6 +16,7 @@ import { hostname, tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.ts";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import {
 	buildDockerEnvFile,
@@ -57,6 +58,13 @@ describeUnix("Docker shell runner (fake docker CLI)", () => {
 
 	const docker_ = (settings: Partial<Extract<ShellRunnerSettings, { type: "docker" }>> = {}) =>
 		resolveShellRunner({ settings: { type: "docker", image: "shell:test", ...settings } }, workspace);
+
+	/** Abort once the fake CLI has recorded the next `docker run`, so the abort cannot land during setup. */
+	const abortWhenRunning = async (controller: AbortController) => {
+		const expected = docker.calls("run").length + 1;
+		await vi.waitFor(() => expect(docker.calls("run")).toHaveLength(expected), { timeout: 10_000, interval: 20 });
+		controller.abort();
+	};
 
 	beforeEach(() => {
 		root = realpathSync(mkdtempSync(join(tmpdir(), "docker-shell-runner-")));
@@ -302,7 +310,7 @@ describeUnix("Docker shell runner (fake docker CLI)", () => {
 
 		const controller = new AbortController();
 		const run = operationsOf(selection).exec("sleep 10", workspace, { onData: () => {}, signal: controller.signal });
-		setTimeout(() => controller.abort(), 300);
+		await abortWhenRunning(controller);
 		await expect(run).rejects.toThrow(/^aborted$/);
 		removeOutstandingDockerContainers();
 
@@ -419,6 +427,26 @@ describeUnix("Docker shell runner (fake docker CLI)", () => {
 			);
 		});
 
+		it("warns when a mount contains the agent directory", async () => {
+			const home = join(root, "home");
+			mkdirSync(join(home, ".october", "agent"), { recursive: true });
+			vi.stubEnv("HOME", home);
+			vi.stubEnv(ENV_AGENT_DIR, undefined);
+			const agentDir = join(home, ".october", "agent");
+			const warning = `Warning: mount ${home} contains the agent directory ${agentDir}; commands can read its credentials (auth.json).`;
+
+			expect((await docker_({ mounts: [{ path: "~", readOnly: true }] })).notice).toContain(
+				`outside this policy. ${warning}`,
+			);
+			expect((await docker_({ mounts: [{ path: "~/.october/agent" }] })).notice).toContain(
+				`mount ${agentDir} contains the agent directory ${agentDir}`,
+			);
+			expect((await docker_()).notice).not.toContain("agent directory");
+			// A sibling with the same prefix does not contain it.
+			mkdirSync(join(home, ".october", "agent2"));
+			expect((await docker_({ mounts: [{ path: "~/.october/agent2" }] })).notice).not.toContain("agent directory");
+		});
+
 		it("rejects the Docker runner on a Windows host", async () => {
 			const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 			Object.defineProperty(process, "platform", { value: "win32" });
@@ -526,7 +554,7 @@ describeUnix("Docker shell runner (fake docker CLI)", () => {
 				signal: controller.signal,
 				timeout: kind === "timeout" ? 0.5 : undefined,
 			});
-			if (kind === "abort") setTimeout(() => controller.abort(), 300);
+			if (kind === "abort") await abortWhenRunning(controller);
 			await expect(run).rejects.toThrow(kind === "abort" ? /^aborted$/ : /^timeout:0.5$/);
 			const name = lastName();
 			expect(docker.containerExists(name)).toBe(false);
@@ -591,7 +619,7 @@ describeUnix("Docker shell runner (fake docker CLI)", () => {
 				onData: () => {},
 				signal: controller.signal,
 			});
-			setTimeout(() => controller.abort(), 150);
+			await abortWhenRunning(controller);
 			await expect(run).rejects.toThrow(/^aborted$/);
 			const name = lastName();
 			await new Promise((resolve) => setTimeout(resolve, 700));
@@ -622,7 +650,7 @@ describeUnix("Docker shell runner (fake docker CLI)", () => {
 			const run = executeBashWithOperations("sleep 10", workspace, operationsOf(selection), {
 				signal: controller.signal,
 			});
-			setTimeout(() => controller.abort(), 300);
+			await abortWhenRunning(controller);
 			const result = await run;
 			expect(result.cancelled).toBe(true);
 			expect(result.output).toContain("could not confirm removal of container october-shell-");
@@ -681,7 +709,7 @@ describeUnix("Docker shell runner (fake docker CLI)", () => {
 					onData: () => {},
 					signal: controller.signal,
 				});
-				setTimeout(() => controller.abort(), 300);
+				await abortWhenRunning(controller);
 				await expect(run).rejects.toThrow(/^aborted$/);
 			}
 			const names = docker.calls("run").map((call) => call.argv[call.argv.indexOf("--name") + 1]);

@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
-import { installFakeDocker } from "./fake-docker-cli.ts";
+import { type FakeDocker, installFakeDocker } from "./fake-docker-cli.ts";
 
 // issue #17: the active shell runner is shown at startup, on stderr in non-interactive modes.
 
@@ -20,11 +20,19 @@ afterEach(() => {
 interface CliRun {
 	stdout: string;
 	stderr: string;
+	code: number | null;
+	docker: FakeDocker;
 	projectDir: string;
 	sessionCwd: string;
 }
 
-async function runCli(options: { globalSettings?: string; args: string[]; withSession?: boolean }): Promise<CliRun> {
+async function runCli(options: {
+	globalSettings?: string;
+	args: string[];
+	withSession?: boolean;
+	/** Drives the running CLI through piped stdin. Without it, stdin is closed. */
+	whileRunning?: (child: ChildProcess, docker: FakeDocker) => Promise<void>;
+}): Promise<CliRun> {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "shell-runner-startup-")));
 	roots.push(root);
 	const agentDir = join(root, "agent");
@@ -47,7 +55,7 @@ async function runCli(options: { globalSettings?: string; args: string[]; withSe
 
 	let stdout = "";
 	let stderr = "";
-	await new Promise<number | null>((resolvePromise, reject) => {
+	const code = await new Promise<number | null>((resolvePromise, reject) => {
 		const child = spawn(process.execPath, ["--import", sourceResolverPath, cliPath, "--no-extensions", ...args], {
 			cwd: projectDir,
 			env: {
@@ -59,18 +67,19 @@ async function runCli(options: { globalSettings?: string; args: string[]; withSe
 				DOCKER_HOST: "",
 				DOCKER_CONTEXT: "",
 			},
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: [options.whileRunning ? "pipe" : "ignore", "pipe", "pipe"],
 		});
-		child.stdout.on("data", (chunk) => {
+		child.stdout?.on("data", (chunk) => {
 			stdout += chunk.toString();
 		});
-		child.stderr.on("data", (chunk) => {
+		child.stderr?.on("data", (chunk) => {
 			stderr += chunk.toString();
 		});
 		child.on("error", reject);
 		child.on("close", resolvePromise);
+		options.whileRunning?.(child, docker).catch(reject);
 	});
-	return { stdout, stderr, projectDir, sessionCwd };
+	return { stdout, stderr, code, docker, projectDir, sessionCwd };
 }
 
 const dockerSettings = JSON.stringify({ shellRunner: { type: "docker", image: "shell:test" } });
@@ -79,7 +88,6 @@ const dockerSettings = JSON.stringify({ shellRunner: { type: "docker", image: "s
 describeUnix("shell runner startup notice", { timeout: 120_000 }, () => {
 	it.each([
 		["print", ["-p", "hello"]],
-		["json", ["--mode", "json", "hello"]],
 		["rpc", ["--mode", "rpc"]],
 	])("shows the Docker runner and its mounts on stderr in %s mode", async (_mode, args) => {
 		const run = await runCli({ globalSettings: dockerSettings, args });
@@ -87,6 +95,22 @@ describeUnix("shell runner startup notice", { timeout: 120_000 }, () => {
 			`Shell runner: docker (image shell:test). Mounts: ${run.projectDir} (read-write). Environment allowlist: none. Only the built-in bash tool and ! commands run in the container`,
 		);
 		expect(run.stdout).not.toContain("Shell runner:");
+	});
+
+	it("emits the Docker runner as a diagnostic record on stdout in json mode", async () => {
+		const run = await runCli({ globalSettings: dockerSettings, args: ["--mode", "json", "hello"] });
+		const records = run.stdout
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as { type: string; level?: string; code?: string; message?: string });
+		const notice = records.find((record) => record.code === "shell_runner");
+		expect(notice).toMatchObject({ type: "diagnostic", level: "info" });
+		expect(notice?.message).toContain(
+			`Shell runner: docker (image shell:test). Mounts: ${run.projectDir} (read-write).`,
+		);
+		// Startup diagnostics precede the session header.
+		expect(records.indexOf(notice!)).toBeLessThan(records.findIndex((record) => record.type === "session"));
+		expect(run.stderr).not.toContain("Shell runner:");
 	});
 
 	it("resolves the default mount against the session cwd chosen with --session", async () => {
@@ -103,16 +127,35 @@ describeUnix("shell runner startup notice", { timeout: 120_000 }, () => {
 		expect(host.stdout).not.toContain("Shell runner:");
 	});
 
-	it("prints nothing without the setting", async () => {
-		const absent = await runCli({ args: ["-p", "hi"] });
+	it.each([
+		["a missing", undefined],
+		["an empty", ""],
+	])("prints nothing for %s global settings file", async (_name, globalSettings) => {
+		const absent = await runCli({ globalSettings, args: ["-p", "hi"] });
 		expect(absent.stderr).not.toContain("Shell runner:");
 		expect(absent.stdout).not.toContain("Shell runner:");
 	});
 
+	it("removes the running container when interrupted with SIGINT", async () => {
+		const run = await runCli({
+			globalSettings: dockerSettings,
+			args: ["--mode", "rpc"],
+			whileRunning: async (child, docker) => {
+				child.stdin?.write(`${JSON.stringify({ type: "bash", command: "sleep 5" })}\n`);
+				await vi.waitFor(() => expect(docker.calls("run")).toHaveLength(1), { timeout: 60_000, interval: 50 });
+				child.kill("SIGINT");
+			},
+		});
+		const name = run.docker.calls("run")[0].argv.at(run.docker.calls("run")[0].argv.indexOf("--name") + 1);
+		expect(run.code).toBe(130);
+		expect(run.docker.calls("rm").some((call) => call.argv.includes(name ?? ""))).toBe(true);
+		expect(run.docker.containerExists(name ?? "")).toBe(false);
+	});
+
 	it("warns that an invalid selection blocks commands until fixed and restarted", async () => {
-		const run = await runCli({ globalSettings: "", args: ["-p", "hi"] });
+		const run = await runCli({ globalSettings: "{ nope", args: ["-p", "hi"] });
 		expect(run.stderr).toMatch(
-			/Warning: Shell runner: blocked\. Global settings file .*settings\.json cannot be used: the file is empty\. Shell commands will not run, on the host or elsewhere; fix this and restart\./,
+			/Warning: Shell runner: blocked\. Global settings file .*settings\.json could not be loaded: .*\. Shell commands will not run, on the host or elsewhere; fix this and restart\./,
 		);
 		expect(run.stdout).not.toContain("Shell runner:");
 	});

@@ -105,6 +105,7 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 |---|---|---|---|
 | `transport` | `"auto" \| "sse" \| "websocket" \| "websocket-cached"` | `"auto"` | Preferred transport for AI providers that support multiple transports. |
 | `httpProxy` | string | None | Proxy URL applied as `HTTP_PROXY` and `HTTPS_PROXY` for Pi-managed HTTP clients. **Can only be set in agent-directory settings.** |
+| `mcpServers` | object | None | Named stdio or Streamable HTTP MCP servers. See [Third-party MCP servers](mcp.md). |
 | `httpIdleTimeoutMs` | number | `300000` | HTTP header and body idle timeout in milliseconds. Set to `0` to disable. |
 | `websocketConnectTimeoutMs` | number | `15000` | WebSocket connection timeout in milliseconds. Set to `0` to disable. |
 | `retry.enabled` | boolean | `true` | Enable automatic agent-level retry for transient failures. |
@@ -123,7 +124,7 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are requir
 |---|---|---|---|
 | `shellPath` | string | Platform default | Custom shell executable path. Supports a leading `~`. |
 | `shellCommandPrefix` | string | None | Prefix prepended to every shell command. |
-| `shellRunner` | object | None (host shell) | Where the built-in `bash` tool and `!` commands run: `{ "type": "host" }` or `{ "type": "docker", "image", "mounts", "envAllowlist", "user" }`. Read once at startup; restart to apply changes. An empty, invalid or unreadable agent-directory settings file blocks shell commands. **Can only be set in agent-directory settings.** |
+| `shellRunner` | object | None (host shell) | Where the built-in `bash` tool and `!` commands run: `{ "type": "host" }` or `{ "type": "docker", "image", "mounts", "envAllowlist", "user" }`. Read once at startup; restart to apply changes. An agent-directory settings file that cannot be parsed or read blocks shell commands; an empty file means host. **Can only be set in agent-directory settings.** |
 | `npmCommand` | `string[]` | `npm` | Command and arguments used for npm package lookup and installation. |
 
 See [Shell aliases](shell-aliases.md) for shell setup, [Route shell commands through the Docker runner](containerization.md#route-shell-commands-through-the-docker-runner) for `shellRunner`, and [Pi Packages](packages.md) for package-manager behavior.

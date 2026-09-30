@@ -364,7 +364,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	};
 
 	const registerSignalHandlers = (): void => {
-		const signals: NodeJS.Signals[] = ["SIGTERM"];
+		// SIGINT (Ctrl+C) also shuts down gracefully, so exit hooks such as shell runner container
+		// cleanup run. A second signal exits immediately.
+		const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
 		if (process.platform !== "win32") {
 			signals.push("SIGHUP");
 		}
@@ -372,7 +374,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		for (const signal of signals) {
 			const handler = () => {
 				killTrackedDetachedChildren();
-				void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
+				void shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, signal);
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -600,6 +602,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			case "export_html": {
 				const path = await session.exportToHtml(command.outputPath);
 				return success(id, "export_html", { path });
+			}
+
+			case "export_jsonl": {
+				return success(id, "export_jsonl", session.exportToJsonl(command.outputPath));
+			}
+
+			case "import_jsonl": {
+				// The runtime rebinds through setRebindSession() when it replaces the session.
+				return success(id, "import_jsonl", await runtimeHost.importPortable(command.inputPath));
 			}
 
 			case "switch_session": {
