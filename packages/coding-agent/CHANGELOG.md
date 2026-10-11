@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.87.1-october.5] - 2026-10-10
+
+### Fixed
+
+- Fixed registry installs of 0.87.1-october.4 missing esbuild entirely. npm installs exactly the entries of a published `npm-shrinkwrap.json` and ignores their platform fields, so the shrinkwrap either installed all 26 esbuild builds (about 285 MB) or, in 0.87.1-october.4, none. The package now ships without a shrinkwrap: npm installs only the current platform's esbuild build (about 164 MB in total on macOS arm64). Direct dependencies stay pinned to exact versions; transitive dependencies resolve within their declared ranges at install time. The `october` CLI did not load esbuild and was unaffected; the experimental plugin bundler was.
+
 ## [0.87.1-october.4] - 2026-10-10
 
 ### Added
