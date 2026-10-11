@@ -31,6 +31,15 @@ function readJson(path) {
 	return JSON.parse(readFileSync(path, "utf8"));
 }
 
+/**
+ * npm ignores os/cpu/libc for entries pinned in a dependency's npm-shrinkwrap.json and installs every
+ * platform build (all 26 @esbuild/* binaries, ~285 MB). Leave optional platform packages out so npm
+ * resolves them from the parent's exact optionalDependencies pin and applies its platform checks.
+ */
+function isOptionalPlatformPackage(entry) {
+	return Boolean(entry.optional && (entry.os || entry.cpu || entry.libc));
+}
+
 function packageDependencies(entry) {
 	return {
 		...(entry.dependencies ?? {}),
@@ -224,6 +233,9 @@ function addExternalPackage(lockPackages, shrinkwrapPackages, addedPaths, queue,
 	}
 
 	const entry = lockPackages[sourceLockPath];
+	if (item.optional && isOptionalPlatformPackage(entry)) {
+		return;
+	}
 	shrinkwrapPackages[outputLockPath] = copyLockEntry(entry);
 	addedPaths.add(outputLockPath);
 
@@ -233,6 +245,7 @@ function addExternalPackage(lockPackages, shrinkwrapPackages, addedPaths, queue,
 			sourceFrom: sourceLockPath,
 			sourceBase: item.sourceBase,
 			outputBase: item.outputBase,
+			optional: entry.optionalDependencies?.[dependencyName] !== undefined,
 		});
 	}
 }
@@ -283,7 +296,8 @@ function validateShrinkwrap(shrinkwrap, internalNames) {
 	}
 
 	for (const [lockPath, entry] of Object.entries(shrinkwrap.packages)) {
-		for (const dependencyName of Object.keys(packageDependencies(entry))) {
+		// Optional platform packages are left out on purpose; see isOptionalPlatformPackage.
+		for (const dependencyName of Object.keys(entry.dependencies ?? {})) {
 			const dependencyIncluded = [...includedPaths].some(
 				(candidate) => candidate === `node_modules/${dependencyName}` || candidate.endsWith(`/node_modules/${dependencyName}`),
 			);
@@ -293,9 +307,10 @@ function validateShrinkwrap(shrinkwrap, internalNames) {
 		}
 	}
 
-	const platformPackageCount = Object.values(shrinkwrap.packages).filter((entry) => entry.os || entry.cpu || entry.libc).length;
-	if (platformPackageCount === 0) {
-		errors.push("no platform-specific optional dependency entries found");
+	for (const [lockPath, entry] of Object.entries(shrinkwrap.packages)) {
+		if (isOptionalPlatformPackage(entry)) {
+			errors.push(`${lockPath} is an optional platform-specific package; npm would install it on every platform`);
+		}
 	}
 
 	if (errors.length > 0) {
@@ -375,10 +390,7 @@ try {
 	} else {
 		writeFileSync(shrinkwrapPath, content);
 		const packageCount = Object.keys(shrinkwrap.packages).length - 1;
-		const platformPackageCount = Object.values(shrinkwrap.packages).filter((entry) => entry.os || entry.cpu || entry.libc).length;
-		console.log(
-			`Wrote packages/coding-agent/npm-shrinkwrap.json (${packageCount} packages, ${platformPackageCount} platform-specific).`,
-		);
+		console.log(`Wrote packages/coding-agent/npm-shrinkwrap.json (${packageCount} packages).`);
 	}
 } catch (error) {
 	console.error(error instanceof Error ? error.message : String(error));

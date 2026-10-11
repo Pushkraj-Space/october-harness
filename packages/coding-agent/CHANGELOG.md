@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.87.1-october.4] - 2026-10-10
+
+### Added
+
+- Added sign-in from a launching app's environment without a refresh token. With `OCTOBER_SUPABASE_URL`, `OCTOBER_SUPABASE_ANON_KEY`, `OCTOBER_SUPABASE_ACCESS_TOKEN`, and optionally `OCTOBER_SUPABASE_EXPIRES_AT`, October uses the token for the model catalog, inference, and plan checks without `/login`, and never writes it to disk. `OCTOBER_TOKEN_COMMAND` names a command that prints `{"accessToken","expiresAt"}`; it runs shortly before expiry and after a 401, and the turn that hit the 401 is retried. When the token expires and cannot be refreshed, October falls back to `/login`. See [Environment variables](docs/environment-variables.md#october-session-from-a-launching-app).
+
+### Fixed
+
+- Fixed `npm install @october-dev/october` installing esbuild binaries for all 26 platforms (about 285 MB). npm ignores platform fields for packages pinned in a dependency's shrinkwrap, so the shrinkwrap no longer pins optional platform packages; npm resolves them from esbuild's exact `optionalDependencies` and installs only the current platform's build.
+
 ## [0.87.1-october.3] - 2026-09-30
 
 ### Added
